@@ -76,10 +76,11 @@ def test_extract_archivo_metadata_maps_expected_fields(spark, sample_xml):
         ["xml_content", "nombreArchivo"],
     )
 
-    result = extract_archivo_metadata(source_df, "corr-123").collect()[0]
+    result = extract_archivo_metadata(source_df).collect()[0]
 
     assert result["idArchivo"] == "MSG-001"
-    assert result["correlationId"] == "corr-123"
+    assert result["correlationId"] is not None
+    assert result["correlationId"] != ""
     assert result["idCliente"] == "3101123456"
     assert result["numeroCliente"] == 12345
     assert result["nombre"] == "pain001_test.xml"
@@ -143,7 +144,7 @@ def test_extract_archivo_metadata_generates_correlation_id_when_empty(spark, sam
         ["xml_content", "nombreArchivo"],
     )
 
-    result = extract_archivo_metadata(source_df, "").collect()[0]
+    result = extract_archivo_metadata(source_df).collect()[0]
 
     assert result["correlationId"] is not None
     assert result["correlationId"] != ""
@@ -190,6 +191,6 @@ def test_extract_archivo_metadata_sets_tipo_proceso_bncr_when_all_ibans_are_0151
         ["xml_content", "nombreArchivo"],
     )
 
-    result = extract_archivo_metadata(source_df, "corr-456").collect()[0]
+    result = extract_archivo_metadata(source_df).collect()[0]
 
     assert result["tipoProceso"] == "BNCR"
