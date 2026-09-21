@@ -1,28 +1,21 @@
 from pyspark import pipelines as dp
-from datetime import datetime, timezone
-import urllib.request
-import json
 from transformations.helpers.xml_parser import build_transferencias
+from transformations.helpers.utils import get_token, send_service_bus_notification, move_file
 
 # =============================================================================
-# Configuración
+# Configuracion
 # =============================================================================
-# Parámetros del pipeline (Pipeline Settings > Configuration)
+# Ruta de la carpeta del storage para los archivos por procesar
 STORAGE_PATH_IN = f"{spark.conf.get('storagePath')}/inbound"
+# Ruta de la carpeta del storage para los archivos procesados
 STORAGE_PATH_PROCESSED = f"{spark.conf.get('storagePath')}/processed"
-
-
-# Azure SQL y Service Bus - autenticación via Service Credential (Managed Identity)
+# Azure SQL y Service Bus - autenticacion via Service Credential (Managed Identity)
 _service_credential = dbutils.credentials.getServiceCredentialsProvider('bncr-dati-conector')
-
-
-def _get_fresh_token(resource):
-    """Obtiene token OAuth fresco. Encapsula dbutils para serialización del sink."""
-    return _service_credential.get_token(resource)
-
-# Azure SQL - servidor y base de datos desde parámetros del pipeline
+# Nombre del servidor Azure SQL
 _sql_server = spark.conf.get("sqlserver")
+# Nombre de la base de datos
 _database = spark.conf.get("database")
+# Configuracion del URL del servidor Azure SQL
 JDBC_URL = (
     f"jdbc:sqlserver://{_sql_server};"
     f"database={_database};"
@@ -31,37 +24,18 @@ JDBC_URL = (
     "hostNameInCertificate=*.database.windows.net;"
     "loginTimeout=30"
 )
-JDBC_TABLE = "dbo.Archivo"
+# Driver para conectarse a la base de datos
+SQL_DRIVER = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+# Tabla SQL para salvar la metadata del archivo
+JDBC_TABLE_FILE = "dbo.Archivo"
+# Tabla SQL para transacciones
+JDBC_TABLE_TX = "dbo.Transferencia"
 # Azure Service Bus - endpoint desde parámetros del pipeline
 SB_TOPIC_ENDPOINT = spark.conf.get("topicsEndPoint").rstrip("/")
-
-
-# =============================================================================
-# Helper: Notificación a Azure Service Bus
-# Envía mensaje al topic tras escritura exitosa en SQL vía REST API.
-# Autenticación via Bearer token (OAuth) del Service Credential.
-# =============================================================================
-def _send_service_bus_notification(file_name, correlation_id, sb_access_token):
-    """Envía notificación al topic de Azure Service Bus."""
-    payload = json.dumps({
-        "nombreArchivo": file_name,
-        "correlationId": correlation_id,
-        "estado": "procesado",
-        "fechaProceso": datetime.now(timezone.utc).isoformat(),
-    })
-
-    send_url = f"{SB_TOPIC_ENDPOINT}/messages"
-
-    req = urllib.request.Request(
-        send_url,
-        data=payload.encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {sb_access_token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    urllib.request.urlopen(req)
+# IDP Azure BD
+IDP_BD = "https://database.windows.net/.default"
+# IDP Azure Service Bus
+IDP_SB = "https://servicebus.azure.net/.default"
 
 
 # =============================================================================
@@ -72,14 +46,14 @@ def _send_service_bus_notification(file_name, correlation_id, sb_access_token):
 @dp.foreach_batch_sink(name="sql_archivo_sink")
 def sql_archivo_sink(df, batch_id):
     # 1. Obtener token fresco via helper serializable (evita closure no serializable)
-    _token = _get_fresh_token("https://database.windows.net/.default")
+    _token = get_token(IDP_BD, _service_credential)
 
     # 2. Filtrar registros ya existentes en dbo.Archivo (evita PK duplicada)
     existing_ids = (df.sparkSession.read
         .format("jdbc")
         .option("url", JDBC_URL)
         .option("dbtable", "(SELECT idArchivo FROM dbo.Archivo) AS existing")
-        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+        .option("driver", SQL_DRIVER)
         .option("accessToken", _token.token)
         .load()
     )
@@ -97,8 +71,8 @@ def sql_archivo_sink(df, batch_id):
     (df.drop("xml_content").write
         .format("jdbc")
         .option("url", JDBC_URL)
-        .option("dbtable", JDBC_TABLE)
-        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+        .option("dbtable", JDBC_TABLE_FILE)
+        .option("driver", SQL_DRIVER)
         .option("accessToken", _token.token)
         .mode("append")
         .save())
@@ -108,23 +82,21 @@ def sql_archivo_sink(df, batch_id):
     (transferencias.write
         .format("jdbc")
         .option("url", JDBC_URL)
-        .option("dbtable", "dbo.Transferencia")
-        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+        .option("dbtable", JDBC_TABLE_TX)
+        .option("driver", SQL_DRIVER)
         .option("accessToken", _token.token)
         .mode("append")
         .save())
 
     # 5. Notificar a Service Bus por cada archivo procesado
-    sb_token = _get_fresh_token("https://servicebus.azure.net/.default")
+    sb_token = get_token(IDP_SB, _service_credential)
     files_processed = df.select("nombre", "correlationId").distinct().collect()
     for row in files_processed:
-        _send_service_bus_notification(row["nombre"], row["correlationId"], sb_token.token)
+        send_service_bus_notification(SB_TOPIC_ENDPOINT, row["nombre"], row["correlationId"], sb_token.token)
 
     # 6. Trasladar archivos procesados de inbound a processed
     for row in files_processed:
-        src = f"{STORAGE_PATH_IN}/{row['nombre']}"
-        dst = f"{STORAGE_PATH_PROCESSED}/{row['nombre']}"
-        dbutils.fs.mv(src, dst)
+        move_file(STORAGE_PATH_IN, STORAGE_PATH_PROCESSED, row['nombre'])
 
     # Liberar cache
     df.unpersist()
