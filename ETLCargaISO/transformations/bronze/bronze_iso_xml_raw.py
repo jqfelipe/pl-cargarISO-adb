@@ -11,8 +11,10 @@ Parámetro: nombreArchivo
 """
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
+from transformations.helpers.utils import DEFAULT_STORAGE_IN, build_storage_path
 
-STORAGE_PATH_IN = f"{spark.conf.get('storagePath')}/inbound"
+STORAGE_PATH_IN = build_storage_path(spark.conf.get("storagePath"), DEFAULT_STORAGE_IN)
+
 
 
 @dp.temporary_view(

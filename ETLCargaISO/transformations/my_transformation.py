@@ -1,41 +1,44 @@
+"""Flujo principal del pipeline Databricks para persistir metadata y transferencias."""
+
 from pyspark import pipelines as dp
+
+from transformations.helpers.utils import (
+    DEFAULT_STORAGE_IN,
+    DEFAULT_STORAGE_PROC,
+    build_runtime_config,
+    build_sql_config,
+    build_storage_path,
+    get_token,
+    jdbc_reader,
+    move_file,
+    send_service_bus_notification,
+    write_jdbc,
+)
 from transformations.helpers.xml_parser import build_transferencias
-from transformations.helpers.utils import get_token, send_service_bus_notification, move_file
 
 # =============================================================================
 # Configuracion
 # =============================================================================
+STORAGE_PATH = spark.conf.get("storagePath")
 # Ruta de la carpeta del storage para los archivos por procesar
-STORAGE_PATH_IN = f"{spark.conf.get('storagePath')}/inbound"
+STORAGE_PATH_IN = build_storage_path(STORAGE_PATH, DEFAULT_STORAGE_IN)
 # Ruta de la carpeta del storage para los archivos procesados
-STORAGE_PATH_PROCESSED = f"{spark.conf.get('storagePath')}/processed"
+STORAGE_PATH_PROCESSED = build_storage_path(STORAGE_PATH, DEFAULT_STORAGE_PROC)
 # Azure SQL y Service Bus - autenticacion via Service Credential (Managed Identity)
-_service_credential = dbutils.credentials.getServiceCredentialsProvider('bncr-dati-conector')
+SERVICE_CREDENTIAL = dbutils.credentials.getServiceCredentialsProvider("bncr-dati-conector")
 # Nombre del servidor Azure SQL
-_sql_server = spark.conf.get("sqlserver")
+SQL_SERVER = spark.conf.get("sqlserver")
 # Nombre de la base de datos
-_database = spark.conf.get("database")
-# Configuracion del URL del servidor Azure SQL
-JDBC_URL = (
-    f"jdbc:sqlserver://{_sql_server};"
-    f"database={_database};"
-    "encrypt=true;"
-    "trustServerCertificate=false;"
-    "hostNameInCertificate=*.database.windows.net;"
-    "loginTimeout=30"
-)
-# Driver para conectarse a la base de datos
-SQL_DRIVER = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
-# Tabla SQL para salvar la metadata del archivo
-JDBC_TABLE_FILE = "dbo.Archivo"
-# Tabla SQL para transacciones
-JDBC_TABLE_TX = "dbo.Transferencia"
-# Azure Service Bus - endpoint desde parámetros del pipeline
-SB_TOPIC_ENDPOINT = spark.conf.get("topicsEndPoint").rstrip("/")
-# IDP Azure BD
-IDP_BD = "https://database.windows.net/.default"
-# IDP Azure Service Bus
-IDP_SB = "https://servicebus.azure.net/.default"
+DATABASE = spark.conf.get("database")
+SQL_CONFIG = build_sql_config(SQL_SERVER, DATABASE)
+JDBC_URL = SQL_CONFIG["jdbc_url"]
+SQL_DRIVER = SQL_CONFIG["sql_driver"]
+JDBC_TABLE_FILE = SQL_CONFIG["table_file"]
+JDBC_TABLE_TX = SQL_CONFIG["table_tx"]
+RUNTIME_CONFIG = build_runtime_config(spark.conf.get("topicsEndPoint"))
+SB_TOPIC_ENDPOINT = RUNTIME_CONFIG["sb_topic_endpoint"]
+IDP_BD = RUNTIME_CONFIG["idp_bd"]
+IDP_SB = RUNTIME_CONFIG["idp_sb"]
 
 
 # =============================================================================
@@ -45,61 +48,60 @@ IDP_SB = "https://servicebus.azure.net/.default"
 # =============================================================================
 @dp.foreach_batch_sink(name="sql_archivo_sink")
 def sql_archivo_sink(df, batch_id):
+    del batch_id
+
     # 1. Obtener token fresco via helper serializable (evita closure no serializable)
-    _token = get_token(IDP_BD, _service_credential)
+    sql_token = get_token(IDP_BD, SERVICE_CREDENTIAL)
 
     # 2. Filtrar registros ya existentes en dbo.Archivo (evita PK duplicada)
-    existing_ids = (df.sparkSession.read
-        .format("jdbc")
-        .option("url", JDBC_URL)
-        .option("dbtable", "(SELECT idArchivo FROM dbo.Archivo) AS existing")
-        .option("driver", SQL_DRIVER)
-        .option("accessToken", _token.token)
-        .load()
-    )
+    existing_ids = jdbc_reader(
+        spark,
+        JDBC_URL,
+        SQL_DRIVER,
+        sql_token.token,
+        "(SELECT idArchivo FROM dbo.Archivo) AS existing",
+    ).load()
     df = df.join(existing_ids, "idArchivo", "left_anti")
 
     if df.isEmpty():
         return
 
-    # Materializar para evitar re-evaluación del left_anti join
-    # (sin cache, el paso de Transferencia re-lee dbo.Archivo y
-    #  encuentra el registro recién insertado, filtrándolo)
+    # Materializar para evitar re-evaluación del left_anti join.
     df = df.cache()
+    try:
+        # 3. Escribir metadata a dbo.Archivo (sin xml_content)
+        write_jdbc(
+            df.drop("xml_content"),
+            JDBC_URL,
+            SQL_DRIVER,
+            JDBC_TABLE_FILE,
+            sql_token.token,
+        )
 
-    # 3. Escribir metadata a dbo.Archivo (sin xml_content)
-    (df.drop("xml_content").write
-        .format("jdbc")
-        .option("url", JDBC_URL)
-        .option("dbtable", JDBC_TABLE_FILE)
-        .option("driver", SQL_DRIVER)
-        .option("accessToken", _token.token)
-        .mode("append")
-        .save())
+        # 4. Construir y escribir transacciones (débito + créditos) a dbo.Transferencia
+        transferencias = build_transferencias(df)
+        write_jdbc(
+            transferencias,
+            JDBC_URL,
+            SQL_DRIVER,
+            JDBC_TABLE_TX,
+            sql_token.token,
+        )
 
-    # 4. Construir y escribir transacciones (débito + créditos) a dbo.Transferencia
-    transferencias = build_transferencias(df)
-    (transferencias.write
-        .format("jdbc")
-        .option("url", JDBC_URL)
-        .option("dbtable", JDBC_TABLE_TX)
-        .option("driver", SQL_DRIVER)
-        .option("accessToken", _token.token)
-        .mode("append")
-        .save())
-
-    # 5. Notificar a Service Bus por cada archivo procesado
-    sb_token = get_token(IDP_SB, _service_credential)
-    files_processed = df.select("nombre", "correlationId").distinct().collect()
-    for row in files_processed:
-        send_service_bus_notification(SB_TOPIC_ENDPOINT, row["nombre"], row["correlationId"], sb_token.token)
-
-    # 6. Trasladar archivos procesados de inbound a processed
-    for row in files_processed:
-        move_file(STORAGE_PATH_IN, STORAGE_PATH_PROCESSED, row['nombre'])
-
-    # Liberar cache
-    df.unpersist()
+        # 5. Notificar a Service Bus por cada archivo procesado
+        files_processed = df.select("nombre", "correlationId").distinct().toLocalIterator()
+        sb_token = get_token(IDP_SB, SERVICE_CREDENTIAL)
+        for row in files_processed:
+            send_service_bus_notification(
+                SB_TOPIC_ENDPOINT,
+                row["nombre"],
+                row["correlationId"],
+                sb_token.token,
+            )
+            move_file(STORAGE_PATH_IN, STORAGE_PATH_PROCESSED, row["nombre"])
+    finally:
+        # Liberar cache aun cuando falle escritura o notificación.
+        df.unpersist()
 
 
 @dp.append_flow(target="sql_archivo_sink")
