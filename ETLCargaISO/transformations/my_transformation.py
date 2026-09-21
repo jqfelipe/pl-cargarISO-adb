@@ -24,8 +24,8 @@ STORAGE_PATH = spark.conf.get("storagePath")
 STORAGE_PATH_IN = build_storage_path(STORAGE_PATH, DEFAULT_STORAGE_IN)
 # Ruta de la carpeta del storage para los archivos procesados
 STORAGE_PATH_PROCESSED = build_storage_path(STORAGE_PATH, DEFAULT_STORAGE_PROC)
-# Azure SQL y Service Bus - autenticacion via Service Credential (Managed Identity)
-SERVICE_CREDENTIAL = dbutils.credentials.getServiceCredentialsProvider("bncr-dati-conector")
+# Nombre del credencial para Azure SQL y Service Bus (Managed Identity)
+SERVICE_CREDENTIAL_NAME = "bncr-dati-conector"
 # Nombre del servidor Azure SQL
 SQL_SERVER = spark.conf.get("sqlserver")
 # Nombre de la base de datos
@@ -50,8 +50,9 @@ IDP_SB = RUNTIME_CONFIG["idp_sb"]
 def sql_archivo_sink(df, batch_id):
     del batch_id
 
-    # 1. Obtener token fresco via helper serializable (evita closure no serializable)
-    sql_token = get_token(IDP_BD, SERVICE_CREDENTIAL)
+    # 1. Obtener credential y token fresco dentro del batch (serializable)
+    service_credential = dbutils.credentials.getServiceCredentialsProvider(SERVICE_CREDENTIAL_NAME)
+    sql_token = get_token(IDP_BD, service_credential)
 
     # 2. Filtrar registros ya existentes en dbo.Archivo (evita PK duplicada)
     existing_ids = jdbc_reader(
@@ -89,8 +90,8 @@ def sql_archivo_sink(df, batch_id):
         )
 
         # 5. Notificar a Service Bus por cada archivo procesado
-        files_processed = df.select("nombre", "correlationId").distinct().toLocalIterator()
-        sb_token = get_token(IDP_SB, SERVICE_CREDENTIAL)
+        files_processed = df.select("nombre", "correlationId").distinct().collect()
+        sb_token = get_token(IDP_SB, service_credential)
         for row in files_processed:
             send_service_bus_notification(
                 SB_TOPIC_ENDPOINT,
@@ -98,7 +99,7 @@ def sql_archivo_sink(df, batch_id):
                 row["correlationId"],
                 sb_token.token,
             )
-            move_file(STORAGE_PATH_IN, STORAGE_PATH_PROCESSED, row["nombre"])
+            move_file(STORAGE_PATH_IN, STORAGE_PATH_PROCESSED, row["nombre"], dbutils)
     finally:
         # Liberar cache aun cuando falle escritura o notificación.
         df.unpersist()

@@ -5,13 +5,12 @@ Independientes del runtime del pipeline — reciben y retornan DataFrames.
 from pyspark.sql import functions as F
 
 
-def extract_archivo_metadata(df, correlation_id):
+def extract_archivo_metadata(df):
     """
     Extrae metadata ISO 20022 del XML y la mapea al esquema dbo.Archivo.
 
     Args:
         df: DataFrame con columnas 'xml_content' y 'nombreArchivo'
-        correlation_id: ID de correlación (str). Si vacío, se genera UUID.
 
     Returns:
         DataFrame con columnas del esquema dbo.Archivo + xml_content
@@ -22,11 +21,8 @@ def extract_archivo_metadata(df, correlation_id):
             "xml_content",
             r"<(?:\w+:)?MsgId>([^<]+)</(?:\w+:)?MsgId>", 1
         ).alias("idArchivo"),
-        # correlationId <- parámetro del pipeline (o UUID si no se proporciona)
-        F.when(
-            F.lit(correlation_id) != "",
-            F.lit(correlation_id)
-        ).otherwise(F.expr("uuid()")).alias("correlationId"),
+        # correlationId <- UUID único por archivo
+        F.expr("uuid()").alias("correlationId"),
         # idCliente <- Othr/Id donde Prtry = CR-CJ
         F.regexp_extract(
             "xml_content",

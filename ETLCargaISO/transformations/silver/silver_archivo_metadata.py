@@ -14,8 +14,6 @@ from transformations.helpers.xml_parser import extract_archivo_metadata
     comment="Metadata ISO 20022 mapeada al esquema dbo.Archivo"
 )
 def silver_archivo_metadata():
-    correlation_id = spark.conf.get("correlationId", "")
     return extract_archivo_metadata(
-        spark.readStream.table("bronze_iso_xml_raw"),
-        correlation_id
+        spark.readStream.table("bronze_iso_xml_raw")
     )

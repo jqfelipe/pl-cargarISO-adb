@@ -104,8 +104,8 @@ def send_service_bus_notification(sb_topic_endpoint, file_name, correlation_id, 
         pass
 
 
-def move_file(origin, dest, file_name):
+def move_file(origin, dest, file_name, _dbutils):
     """Mueve archivo a carpeta de archivos procesados."""
     src = f"{origin}/{file_name}"
     dst = f"{dest}/{file_name}"
-    dbutils.fs.mv(src, dst)
+    _dbutils.fs.mv(src, dst)
